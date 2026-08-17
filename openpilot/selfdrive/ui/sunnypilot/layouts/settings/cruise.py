@@ -9,7 +9,7 @@ from enum import IntEnum
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.cruise_sub_layouts.speed_limit_settings import SpeedLimitSettingsLayout
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.multilang import tr, tr_noop
-from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, option_item_sp, simple_button_item_sp
+from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, option_item_sp, simple_button_item_sp, multiple_button_item_sp
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 
@@ -87,9 +87,29 @@ class CruiseLayout(Widget):
       description=tr("Enable toggle to allow the model to determine when to use sunnypilot ACC or sunnypilot End to End Longitudinal."),
       param="DynamicExperimentalControl")
 
+    self.lead_tracking_mode = multiple_button_item_sp(
+      title=tr("Radar Lead Tracking"),
+      description=tr("How sunnypilot picks and holds the radar lead. Stock: per-frame match. " +
+                     "Stable Lead: sticks to the held track to stop lead flicker. " +
+                     "Stable + Vision Coast: also briefly holds the lead through a sudden radar phantom the camera doesn't confirm."),
+      buttons=[lambda: tr("Stock"), lambda: tr("Stable Lead"), lambda: tr("Stable + Vision Coast")],
+      param="LeadTrackingMode",
+      button_width=400,
+      inline=False,
+    )
+
+    self.lead_tracking_spatial = toggle_item_sp(
+      title=tr("Spatial Lead Matching"),
+      description=tr("Hold the radar lead by position and speed continuity instead of radar track ID. " +
+                     "Built for radars that rapidly renumber their track IDs (e.g. Rivian); other cars can try it too. " +
+                     "Applies to Stable Lead and Stable + Vision Coast."),
+      param="LeadTrackingSpatial")
+
     items = [
       self.icbm_toggle,
       self.dec_toggle,
+      self.lead_tracking_mode,
+      self.lead_tracking_spatial,
       self.scc_v_toggle,
       self.scc_m_toggle,
       self.custom_acc_toggle,
@@ -118,6 +138,8 @@ class CruiseLayout(Widget):
 
   def _update_state(self):
     super()._update_state()
+
+    self.lead_tracking_mode.action_item.set_selected_button(ui_state.params.get("LeadTrackingMode", return_default=True))
 
     if ui_state.CP is not None and ui_state.CP_SP is not None:
       has_icbm = ui_state.has_icbm
