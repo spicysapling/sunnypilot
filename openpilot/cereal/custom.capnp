@@ -495,5 +495,11 @@ struct CustomReserved17 @0xa30662f84033036c {
 struct CustomReserved18 @0xc86a3d38d13eb3ef {
 }
 
-struct CustomReserved19 @0xa4f1eb3323f5f582 {
+# sunnypilot radarState annotations — mirrors the per-lead coast state from radard's Tier-3
+# vision-coast (see selfdrive/controls/radard.py). Occupies reserved fork slot @145 / this
+# struct id (was CustomReserved19) so upstream event-union growth can never collide with it.
+# The UI subscribes to this alongside the stock radarState.
+struct RadarStateSP @0xa4f1eb3323f5f582 {
+  leadOneCoasting @0 :Bool;   # leadOne is currently held by vision-coast (a phantom was rejected)
+  leadTwoCoasting @1 :Bool;   # leadTwo is currently held by vision-coast
 }
