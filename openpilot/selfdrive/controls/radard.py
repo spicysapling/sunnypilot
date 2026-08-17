@@ -30,6 +30,19 @@ V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
 
 
+# Spatial/kinematic association (the LeadTrackingSpatial toggle). The Rivian Mando radar renumbers
+# track ids ~60/sec (median track life ~1 frame; corpus drive 00000231/24-25), so id-keyed hysteresis
+# is INERT on it — it has no stable id to stay sticky to (measured: Tier-2 == Tier-1 exactly on that
+# drive). Instead we bias the matcher toward the radar track nearest the PREVIOUS emitted lead in
+# position AND relative velocity — id-free, so it survives the renumbering. Velocity-agreement is the
+# key discriminator: it rejects roadside clutter and the far/near mis-grabs that share the lead's
+# lane but not its speed. User-selectable on any brand (default off, id-keyed); validated on Rivian.
+# Tuned ("vel_cont L5/Lv1") on the id-churn corpus: vs id-keyed hysteresis, -17% brake-jumps,
+# 0 radar-corroborated streak regressions.
+SPATIAL_POS_RC = 5.0   # m   — position-continuity length scale
+SPATIAL_VEL_RC = 1.0   # m/s — relative-velocity-continuity length scale
+
+
 @dataclass
 class RadarLead:
   """A radarState leadOne/leadTwo estimate. Field names mirror cereal LeadData, so an instance
@@ -132,7 +145,10 @@ def laplacian_pdf(x: float, mu: float, b: float):
   return math.exp(-abs(x-mu)/b)
 
 
-def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks: dict[int, Track]) -> Track | None:
+def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks: dict[int, Track],
+                          prev_track_id: int | None = None, stickiness: float = 5.0,
+                          prev_lead_state: tuple[float, float, float] | None = None,
+                          pos_rc: float = SPATIAL_POS_RC, vel_rc: float = SPATIAL_VEL_RC) -> Track | None:
   offset_vision_dist = lead.x[0] - RADAR_TO_CAMERA
 
   def prob(c):
@@ -141,7 +157,24 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
     prob_v = laplacian_pdf(c.vRel + v_ego, lead.v[0], lead.vStd[0])
 
     # This isn't exactly right, but it's a good heuristic
-    return prob_d * prob_y * prob_v
+    base = prob_d * prob_y * prob_v
+    # Hysteresis: bias toward the lead we were already tracking so a challenger must beat it by a
+    # margin before we switch — prevents frame-to-frame flipping when two radar tracks have similar
+    # probability.
+    if prev_lead_state is not None:
+      # Spatial/kinematic (Rivian): bias the track nearest the previous emitted lead in position AND
+      # relative velocity. Id-free, so it survives the Rivian radar's track-id renumbering (~60/sec)
+      # that makes id-keyed stickiness inert. Velocity-agreement rejects clutter and far/near
+      # mis-grabs that share the lead's lane but not its speed. See SPATIAL_POS_RC / SPATIAL_VEL_RC.
+      prev_dRel, prev_yRel, prev_vRel = prev_lead_state
+      pos = math.hypot(c.dRel - prev_dRel, c.yRel - prev_yRel)
+      base *= math.exp(-pos / pos_rc) * math.exp(-abs(c.vRel - prev_vRel) / vel_rc)
+    elif prev_track_id is not None and c.identifier == prev_track_id:
+      # Id-keyed (brands with stable radar ids): bias the previously-chosen track, scaled by the
+      # lateral-agreement probability so the held track releases its bonus when it drifts away from
+      # the camera's predicted lateral position (only stay sticky while the camera still supports it).
+      base *= 1.0 + (stickiness - 1.0) * prob_y
+    return base
 
   track = max(tracks.values(), key=prob)
 
@@ -174,10 +207,13 @@ def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: floa
 
 def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capnp._DynamicStructReader,
              model_v_ego: float, lead_prob: float, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
-             low_speed_override: bool = True) -> RadarLead:
+             low_speed_override: bool = True, prev_track_id: int | None = None,
+             prev_lead_state: tuple[float, float, float] | None = None,
+             pos_rc: float = SPATIAL_POS_RC, vel_rc: float = SPATIAL_VEL_RC) -> RadarLead:
   # Determine leads, this is where the essential logic happens
   if len(tracks) > 0 and ready and lead_prob > .5:
-    track = match_vision_to_track(v_ego, lead_msg, tracks)
+    track = match_vision_to_track(v_ego, lead_msg, tracks, prev_track_id=prev_track_id,
+                                  prev_lead_state=prev_lead_state, pos_rc=pos_rc, vel_rc=vel_rc)
   else:
     track = None
 
@@ -228,7 +264,30 @@ class RadarD:
 
     self.ready = False
 
+    # Hysteresis state for match_vision_to_track. With the LeadTrackingSpatial toggle we anchor on
+    # the previous emitted lead's (dRel, yRel, vRel) — id-free spatial/kinematic continuity (see
+    # SPATIAL_POS_RC), built for radars that renumber track ids (e.g. Rivian) but selectable on any
+    # brand. Toggle off (default): id-keyed stickiness on the last selected radar trackId.
+    # Refreshed ~1 Hz alongside the tier below; offline harnesses set use_spatial_assoc directly.
+    self.use_spatial_assoc = False
+    self.prev_lead_track_id: dict[int, int | None] = {0: None, 1: None}
+    self.prev_lead_state: dict[int, tuple[float, float, float] | None] = {0: None, 1: None}
+
+    # behavior tier: 1=no hysteresis (greedy match), 2=hysteresis (spatial/kinematic with the
+    # LeadTrackingSpatial toggle, id-keyed otherwise). Chosen by the LeadTrackingMode UI selector, which stores a button index
+    # (0/1 -> tier 1/2); main() refreshes it ~1 Hz via the DEC throttled-read pattern (never
+    # per-frame disk I/O). update() never reads Params, so offline eval harnesses just set
+    # self.lead_tracking_mode directly and it sticks. Defaults to Tier 2 (the validated behavior).
+    self.params = Params()
+    self.frame = 0
+    self.lead_tracking_mode = 2
+    # spatial-association length scales (Rivian) — instance attrs so they can be swept at runtime
+    self.spatial_pos_rc = SPATIAL_POS_RC
+    self.spatial_vel_rc = SPATIAL_VEL_RC
+
   def update(self, sm: messaging.SubMaster, rr: car.RadarData):
+    self.frame += 1
+
     self.ready = sm.seen['modelV2']
 
     if sm.recv_frame['carState'] != self.last_v_ego_frame:
@@ -275,10 +334,47 @@ class RadarD:
         else:
           self.lead_prob_filters[i].update(lead_prob)
 
-      self.radar_state.leadOne = asdict(get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego,
-                                                 self.lead_prob_filters[0].x, self.CP, self.CP_SP, low_speed_override=True))
-      self.radar_state.leadTwo = asdict(get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego,
-                                                 self.lead_prob_filters[1].x, self.CP, self.CP_SP, low_speed_override=False))
+      tier = self.lead_tracking_mode
+      # Tier 1: no hysteresis (greedy match). Tier 2: hysteresis — spatial/kinematic anchor with
+      # the LeadTrackingSpatial toggle (radars that renumber ids), id-keyed otherwise.
+      sticky = [None, None]
+      anchor: list[tuple[float, float, float] | None] = [None, None]
+      if tier >= 2:
+        if self.use_spatial_assoc:
+          anchor = [self.prev_lead_state[0], self.prev_lead_state[1]]
+        else:
+          sticky = [self.prev_lead_track_id[0], self.prev_lead_track_id[1]]
+      one = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego, self.lead_prob_filters[0].x,
+                     self.CP, self.CP_SP, low_speed_override=True, prev_track_id=sticky[0], prev_lead_state=anchor[0],
+                     pos_rc=self.spatial_pos_rc, vel_rc=self.spatial_vel_rc)
+      two = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego, self.lead_prob_filters[1].x,
+                     self.CP, self.CP_SP, low_speed_override=False, prev_track_id=sticky[1], prev_lead_state=anchor[1],
+                     pos_rc=self.spatial_pos_rc, vel_rc=self.spatial_vel_rc)
+      self.radar_state.leadOne = asdict(one)
+      self.radar_state.leadTwo = asdict(two)
+      # remember the chosen radar track id (id-keyed hysteresis bonus) and the matcher's pick
+      # (spatial anchor) for the next frame
+      for i, ld in ((0, one), (1, two)):
+        if ld.present and ld.radar and ld.radarTrackId >= 0:
+          self.prev_lead_track_id[i] = ld.radarTrackId
+        else:
+          self.prev_lead_track_id[i] = None
+        # spatial-association anchor: the matcher's own pick (radar OR vision fallback), id-free.
+        # Follows a closing lead down frame-by-frame; cleared when there's no lead to anchor.
+        self.prev_lead_state[i] = (ld.dRel, ld.yRel, ld.vRel) if ld.present else None
+
+  def _read_lead_tracking_params(self) -> None:
+    # The UI selector stores a button index (0/1/2); map it to the tier (1/2/3). The spatial toggle
+    # maps straight onto use_spatial_assoc. Called ~1 Hz from main() only (NOT update()), so a
+    # harness that sets lead_tracking_mode / use_spatial_assoc directly isn't clobbered. Tolerate
+    # absent keys (e.g. before a params rebuild) by keeping the current values.
+    try:
+      idx = self.params.get("LeadTrackingMode", return_default=True)
+      if idx is not None:
+        self.lead_tracking_mode = int(idx) + 1
+      self.use_spatial_assoc = self.params.get_bool("LeadTrackingSpatial")
+    except Exception:
+      pass
 
   def publish(self, pm: messaging.PubMaster):
     assert self.radar_state is not None
@@ -311,6 +407,12 @@ def main() -> None:
   while 1:
     sm.update()
 
+    # refresh the lead-tracking params (tier selector + spatial toggle) ~1 Hz — the same sm.frame-
+    # gated main-loop param-read idiom as selfdrived/card/paramsd (cheap; never per-frame disk I/O).
+    # sm.frame is 0 on the first pass so the settings are live from boot. Kept out of update() so
+    # offline harnesses pin the behavior by setting the attrs directly.
+    if sm.frame % int(1. / DT_MDL) == 0:
+      RD._read_lead_tracking_params()
     RD.update(sm, sm['radarTracks'])
     RD.publish(pm)
 
