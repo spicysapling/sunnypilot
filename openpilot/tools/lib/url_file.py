@@ -15,7 +15,10 @@ from urllib3.exceptions import MaxRetryError
 #  Cache chunk size
 K = 1000
 CHUNK_SIZE = 1000 * K
-CACHE_SIZE = 10 * 1024 * 1024 * 1024  # total cache size in GB
+# Upstream default 10 GB, overridable via COMMA_CACHE_SIZE_GB — corpus work needs a bigger cache
+# (server copies expire and the device rotates old segs, so an evicted seg can be unrecoverable).
+# LRU pruning estimates size as len(manifest) * CHUNK_SIZE, i.e. the cap is really a file-count cap.
+CACHE_SIZE = int(os.getenv("COMMA_CACHE_SIZE_GB", "10")) * 1024 * 1024 * 1024
 
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
