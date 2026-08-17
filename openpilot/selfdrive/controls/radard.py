@@ -2,7 +2,7 @@
 import math
 import numpy as np
 from collections import deque
-from typing import Any
+from dataclasses import dataclass, asdict
 
 import capnp
 from openpilot.cereal import messaging, log, custom
@@ -28,6 +28,24 @@ SPEED, ACCEL = 0, 1     # Kalman filter states enum
 V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
 
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
+
+
+@dataclass
+class RadarLead:
+  """A radarState leadOne/leadTwo estimate. Field names mirror cereal LeadData, so an instance
+  maps onto the cereal struct via asdict(); the defaults match cereal's defaults, so a bare
+  RadarLead() is the 'no lead' value (present=False) — it replaces the old {'present': False} dict."""
+  present: bool = False
+  dRel: float = 0.0
+  yRel: float = 0.0
+  vRel: float = 0.0
+  vLead: float = 0.0
+  vLeadK: float = 0.0
+  aLeadK: float = 0.0
+  aLeadTau: float = 0.0
+  modelProb: float = 0.0
+  radar: bool = False
+  radarTrackId: int = -1
 
 
 class KalmanParams:
@@ -84,20 +102,20 @@ class Track:
 
     self.cnt += 1
 
-  def get_RadarState(self, model_prob: float = 0.0):
-    return {
-      "dRel": float(self.dRel),
-      "yRel": float(self.yRel),
-      "vRel": float(self.vRel),
-      "vLead": float(self.vLead),
-      "vLeadK": float(self.vLeadK),
-      "aLeadK": float(self.aLeadK),
-      "aLeadTau": float(self.aLeadTau.x),
-      "present": True,
-      "modelProb": model_prob,
-      "radar": True,
-      "radarTrackId": self.identifier,
-    }
+  def get_RadarState(self, model_prob: float = 0.0) -> RadarLead:
+    return RadarLead(
+      dRel=float(self.dRel),
+      yRel=float(self.yRel),
+      vRel=float(self.vRel),
+      vLead=float(self.vLead),
+      vLeadK=float(self.vLeadK),
+      aLeadK=float(self.aLeadK),
+      aLeadTau=float(self.aLeadTau.x),
+      present=True,
+      modelProb=model_prob,
+      radar=True,
+      radarTrackId=self.identifier,
+    )
 
   def potential_low_speed_lead(self, v_ego: float):
     # stop for stuff in front of you and low speed, even without model confirmation
@@ -114,7 +132,7 @@ def laplacian_pdf(x: float, mu: float, b: float):
   return math.exp(-abs(x-mu)/b)
 
 
-def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks: dict[int, Track]):
+def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks: dict[int, Track]) -> Track | None:
   offset_vision_dist = lead.x[0] - RADAR_TO_CAMERA
 
   def prob(c):
@@ -137,38 +155,38 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
     return None
 
 
-def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: float, model_v_ego: float, lead_prob: float):
+def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: float, model_v_ego: float, lead_prob: float) -> RadarLead:
   lead_v_rel_pred = lead_msg.v[0] - model_v_ego
-  return {
-    "dRel": float(lead_msg.x[0] - RADAR_TO_CAMERA),
-    "yRel": float(-lead_msg.y[0]),
-    "vRel": float(lead_v_rel_pred),
-    "vLead": float(v_ego + lead_v_rel_pred),
-    "vLeadK": float(v_ego + lead_v_rel_pred),
-    "aLeadK": float(lead_msg.a[0]),
-    "aLeadTau": 0.3,
-    "modelProb": float(lead_prob),
-    "present": True,
-    "radar": False,
-    "radarTrackId": -1,
-  }
+  return RadarLead(
+    dRel=float(lead_msg.x[0] - RADAR_TO_CAMERA),
+    yRel=float(-lead_msg.y[0]),
+    vRel=float(lead_v_rel_pred),
+    vLead=float(v_ego + lead_v_rel_pred),
+    vLeadK=float(v_ego + lead_v_rel_pred),
+    aLeadK=float(lead_msg.a[0]),
+    aLeadTau=0.3,
+    modelProb=float(lead_prob),
+    present=True,
+    radar=False,
+    radarTrackId=-1,
+  )
 
 
 def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capnp._DynamicStructReader,
              model_v_ego: float, lead_prob: float, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
-             low_speed_override: bool = True) -> dict[str, Any]:
+             low_speed_override: bool = True) -> RadarLead:
   # Determine leads, this is where the essential logic happens
   if len(tracks) > 0 and ready and lead_prob > .5:
     track = match_vision_to_track(v_ego, lead_msg, tracks)
   else:
     track = None
 
-  lead_dict = {'present': False}
+  lead = RadarLead()
   if track is not None:
-    lead_dict = track.get_RadarState(lead_prob)
-    lead_dict = get_custom_yrel(CP, CP_SP, lead_dict, lead_msg)
+    lead = track.get_RadarState(lead_prob)
+    lead = get_custom_yrel(CP, CP_SP, lead, lead_msg)
   elif (track is None) and ready and (lead_prob > .5):
-    lead_dict = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego, lead_prob)
+    lead = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego, lead_prob)
 
   if low_speed_override:
     low_speed_tracks = [c for c in tracks.values() if c.potential_low_speed_lead(v_ego)]
@@ -176,19 +194,19 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
       closest_track = min(low_speed_tracks, key=lambda c: c.dRel)
 
       # Only choose new track if it is actually closer than the previous one
-      if (not lead_dict['present']) or (closest_track.dRel < lead_dict['dRel']):
-        lead_dict = closest_track.get_RadarState()
+      if (not lead.present) or (closest_track.dRel < lead.dRel):
+        lead = closest_track.get_RadarState()
 
-  return lead_dict
+  return lead
 
 
-def get_custom_yrel(CP: structs.CarParams, CP_SP: structs.CarParamsSP, lead_dict: dict[str, Any],
-                    lead_msg: capnp._DynamicStructReader) -> dict[str, Any]:
+def get_custom_yrel(CP: structs.CarParams, CP_SP: structs.CarParamsSP, lead: RadarLead,
+                    lead_msg: capnp._DynamicStructReader) -> RadarLead:
   if CP.brand == "hyundai" and (CP_SP.flags & HyundaiFlagsSP.ENHANCED_SCC or
                                 CP.flags & (HyundaiFlags.CANFD_CAMERA_SCC | HyundaiFlags.CAMERA_SCC)):
-    lead_dict['yRel'] = float(-lead_msg.y[0])
+    lead.yRel = float(-lead_msg.y[0])
 
-  return lead_dict
+  return lead
 
 
 class RadarD:
@@ -257,10 +275,10 @@ class RadarD:
         else:
           self.lead_prob_filters[i].update(lead_prob)
 
-      self.radar_state.leadOne = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego, self.lead_prob_filters[0].x,
-                                          self.CP, self.CP_SP, low_speed_override=True)
-      self.radar_state.leadTwo = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego, self.lead_prob_filters[1].x,
-                                          self.CP, self.CP_SP, low_speed_override=False)
+      self.radar_state.leadOne = asdict(get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego,
+                                                 self.lead_prob_filters[0].x, self.CP, self.CP_SP, low_speed_override=True))
+      self.radar_state.leadTwo = asdict(get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego,
+                                                 self.lead_prob_filters[1].x, self.CP, self.CP_SP, low_speed_override=False))
 
   def publish(self, pm: messaging.PubMaster):
     assert self.radar_state is not None
